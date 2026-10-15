@@ -1,0 +1,182 @@
+extends Control
+
+# --- REFERÊNCIAS DOS NÓS DA INTERFACE ---
+@onready var grid_container: GridContainer = $GridPecas
+@onready var label_ganho: Label = $UIBar/LabelGanho
+@onready var label_aposta: Label = $UIBar/LabelAposta
+@onready var label_carteira: Label = $UIBar/LabelCarteira
+
+var http_request: HTTPRequest
+
+@onready var botao_girar: TextureButton = $BotaoGirar
+@onready var botao_aumentar: TextureButton = $BotaoAumentar
+@onready var botao_diminuir: TextureButton = $BotaoDiminuir
+
+# URL do endpoint PHP unificado no servidor
+const URL_API = "https://carlitoslocacoes.com/farolqr/tigrinho/api_roleta.php"
+
+var chaves_pecas = ["peca0", "peca1", "peca2", "peca3", "peca4", "peca5"]
+
+var valores_aposta: Array[int] = [2, 4, 6, 8, 10]
+var indice_aposta_atual: int = 0
+var valor_apostado: int = 2
+
+var saldo_carteira: int = 0 
+var usuario_autenticado: bool = false
+
+func _ready() -> void:
+	randomize()
+	
+	# Cria e adiciona o HTTPRequest por código de forma totalmente segura
+	http_request = HTTPRequest.new()
+	add_child(http_request)
+	http_request.request_completed.connect(_on_http_request_completed)
+	
+	if botao_girar:
+		botao_girar.pressed.connect(_on_botao_girar_pressed)
+	if botao_aumentar:
+		botao_aumentar.pressed.connect(_on_botao_aumentar_pressed)
+	if botao_diminuir:
+		botao_diminuir.pressed.connect(_on_botao_diminuir_pressed)
+	
+	# Prepara os 9 slots visuais de imediato para a interface nunca sumir
+	preparar_grid_slots()
+	girar_pecas_iniciais()
+	atualizar_interface()
+	
+	# Puxa o saldo real da sessão direto do banco de dados MySQL
+	carregar_saldo_inicial()
+
+func carregar_saldo_inicial() -> void:
+	var erro = http_request.request(URL_API)
+	if erro != OK:
+		print("Erro ao conectar com o servidor para buscar o saldo.")
+
+func preparar_grid_slots() -> void:
+	if grid_container.get_child_count() < 9:
+		for child in grid_container.get_children():
+			child.queue_free()
+		
+		for i in range(9):
+			var t_rect = TextureRect.new()
+			t_rect.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+			t_rect.stretch_mode = TextureRect.STRETCH_SCALE
+			t_rect.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+			t_rect.size_flags_vertical = Control.SIZE_EXPAND_FILL
+			grid_container.add_child(t_rect)
+	else:
+		for child in grid_container.get_children():
+			if child is TextureRect:
+				child.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+				child.stretch_mode = TextureRect.STRETCH_SCALE
+
+func _on_botao_aumentar_pressed() -> void:
+	if not usuario_autenticado: return
+	if indice_aposta_atual < valores_aposta.size() - 1:
+		indice_aposta_atual += 1
+		valor_apostado = valores_aposta[indice_aposta_atual]
+		atualizar_interface()
+
+func _on_botao_diminuir_pressed() -> void:
+	if not usuario_autenticado: return
+	if indice_aposta_atual > 0:
+		indice_aposta_atual -= 1
+		valor_apostado = valores_aposta[indice_aposta_atual]
+		atualizar_interface()
+
+func atualizar_interface() -> void:
+	if label_aposta:
+		label_aposta.text = "R$ " + str(valor_apostado)
+	if label_carteira:
+		label_carteira.text = "R$ " + str(saldo_carteira)
+
+func _on_botao_girar_pressed() -> void:
+	if not usuario_autenticado:
+		if label_ganho: label_ganho.text = "Não autorizado!"
+		return
+		
+	if saldo_carteira < valor_apostado:
+		if label_ganho:
+			label_ganho.text = "Sem saldo!"
+		return
+	
+	piscar_botao_vermelho()
+	
+	var headers = ["Content-Type: application/x-www-form-urlencoded"]
+	var body = "valor_aposta=" + str(valor_apostado)
+	
+	http_request.request(URL_API, headers, HTTPClient.METHOD_POST, body)
+
+func _on_http_request_completed(result: int, response_code: int, headers: PackedStringArray, body: PackedByteArray) -> void:
+	if response_code != 200:
+		return
+		
+	var json = JSON.new()
+	if json.parse(body.get_string_from_utf8()) != OK:
+		return
+		
+	var resposta = json.get_data()
+	
+	if resposta.has("status") and resposta["status"] == "erro":
+		usuario_autenticado = false
+		if label_ganho:
+			label_ganho.text = resposta["mensagem"]
+		if label_carteira:
+			label_carteira.text = "Sessão expirada"
+		return
+
+	usuario_autenticado = true
+
+	# Resposta de leitura do saldo inicial (GET)
+	if resposta.has("saldo") and not resposta.has("grid"):
+		saldo_carteira = int(resposta["saldo"])
+		atualizar_interface()
+		return
+	
+	# Resposta do giro da roleta processado no PHP/BD (POST)
+	if resposta.get("status") == "sucesso":
+		saldo_carteira = int(resposta["novo_saldo"])
+		atualizar_grid_visual(resposta["grid"])
+		
+		var resultado_rodada = int(resposta["resultado"])
+		if label_ganho:
+			if resultado_rodada > 0:
+				label_ganho.text = "+ R$ " + str(resultado_rodada)
+			else:
+				label_ganho.text = "- R$ " + str(abs(resultado_rodada))
+				
+		atualizar_interface()
+
+func girar_pecas_iniciais() -> void:
+	var grid_inicial = []
+	for l in range(3):
+		var linha = []
+		for c in range(3):
+			linha.append(chaves_pecas[randi() % chaves_pecas.size()])
+		grid_inicial.append(linha)
+	atualizar_grid_visual(grid_inicial)
+
+func atualizar_grid_visual(grid_dados: Array) -> void:
+	var slots = grid_container.get_children()
+	if slots.size() < 9:
+		return
+		
+	var index = 0
+	for linha in range(3):
+		for coluna in range(3):
+			if index < slots.size() and linha < grid_dados.size() and coluna < grid_dados[linha].size():
+				var nome_peca = grid_dados[linha][coluna]
+				var texture_rect = slots[index] as TextureRect
+				
+				if texture_rect:
+					var caminho_imagem = "res://" + nome_peca + ".png"
+					var textura_carregada = load(caminho_imagem)
+					if textura_carregada:
+						texture_rect.texture = textura_carregada
+			index += 1
+
+func piscar_botao_vermelho() -> void:
+	if botao_girar:
+		var tween = create_tween()
+		tween.tween_property(botao_girar, "modulate", Color(1, 0.2, 0.2), 0.05)
+		tween.tween_property(botao_girar, "modulate", Color.WHITE, 0.15)
